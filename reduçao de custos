@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Cost Optimization Project - Full CloudFormation Template.
+  Includes Budgets, Cost & Usage Report (CUR), S3 lifecycle policies, EC2 scheduler,
+  EBS janitor, AWS Config rules, and CloudWatch dashboard.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email for cost alerts
+  MonthlyBudgetAmount:
+    Type: Number
+    Default: 1000
+    Description: Monthly budget amount in USD
+  DevTagKey:
+    Type: String
+    Default: Env
+    Description: Tag key for dev instances
+  DevTagValue:
+    Type: String
+    Default: Dev
+    Description: Tag value for dev instances
+
+Resources:
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetAmount
+          Unit: USD
+        BudgetName: Monthly-Cost-Budget
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertsTopic
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertsTopic
+
+  CurBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: Transition
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 180
+            ExpirationInDays: 730
+
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeVolumes
+                  - ec2:DeleteVolume
+                  - ec2:DescribeSnapshots
+                  - ec2:DeleteSnapshot
+                  - sns:Publish
+                Resource: "*"
+
+  DevEc2Scheduler:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AutomationRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, os
+          ec2 = boto3.client('ec2')
+          sns = boto3.client('sns')
+          def handler(event, context):
+              action = event.get("action","stop")
+              response = ec2.describe_instances(Filters=[
+                  {"Name":f"tag:{os.environ['DevTagKey']}", "Values":[os.environ['DevTagValue']]}
+              ])
+              ids = [i["InstanceId"] for r in response["Reservations"] for i in r["Instances"]]
+              if ids:
+                  if action == "start":
+                      ec2.start_instances(InstanceIds=ids)
+                      sns.publish(TopicArn=os.environ["AlertsTopic"],Subject="EC2 Started",Message=str(ids))
+                  else:
+                      ec2.stop_instances(InstanceIds=ids)
+                      sns.publish(TopicArn=os.environ["AlertsTopic"],Subject="EC2 Stopped",Message=str(ids))
+      Environment:
+        Variables:
+          DevTagKey: !Ref DevTagKey
+          DevTagValue: !Ref DevTagValue
+          AlertsTopic: !Ref AlertsTopic
+
+  EbsJanitor:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AutomationRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3, datetime
+          from dateutil.tz import tzutc
+          ec2 = boto3.client('ec2')
+          def handler(event, context):
+              vols = ec2.describe_volumes(Filters=[{'Name':'status','Values':['available']}])['Volumes']
+              deleted = []
+              for v in vols:
+                  age = (datetime.datetime.now(tzutc()) - v['CreateTime']).days
+                  if age > 7:
+                      ec2.delete_volume(VolumeId=v['VolumeId'])
+                      deleted.append(v['VolumeId'])
+              return {"deleted_volumes": deleted}
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRole
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: default
+      RoleARN: !GetAtt ConfigRole.Arn
+      RecordingGroup:
+        AllSupported: true
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      S3BucketName: !Ref ConfigBucket
+
+  ConfigRuleTags:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: required-tags
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      InputParameters:
+        tag1Key: !Ref DevTagKey
+        tag2Key: Project
+
+  CostDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Cost-Optimization
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "# AWS Cost Optimization Dashboard" }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [[ "AWS/Billing", "EstimatedCharges", "Currency", "USD" ]],
+                "region": "us-east-1",
+                "title": "Estimated Charges (USD)"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  AlertsTopicArn:
+    Description: SNS topic for budget alerts
+    Value: !Ref AlertsTopic
+  CurBucketName:
+    Description: Bucket name for Cost & Usage Reports
+    Value: !Ref CurBucket
+  DashboardName:
+    Description: CloudWatch Dashboard name
+    Value: !Ref CostDashboard
